@@ -1,0 +1,54 @@
+[tool.poetry]
+name = "psi"
+version = "0.1.0"
+description = "PSI Microservices Architecture"
+authors = ["causita <tu-email@algo.com>"]
+readme = "README.md"
+packages = [
+    { include = "services" },
+    { include = "shared" },
+]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+
+# API / Core
+fastapi = "^0.110.0"
+uvicorn = { extras = ["standard"], version = "^0.27.0" }
+pydantic = "^2.6.0"
+pydantic-settings = "^2.2.0"
+python-dotenv = "^1.0.1"
+
+# Data & storage
+sqlalchemy = "^2.0.29"
+psycopg = {version = "^3.1.18", extras = ["binary"]}
+
+redis = "^5.0.3"
+orjson = "^3.9.15"
+
+# Kafka (producer/consumer)
+confluent-kafka = "^2.3.0"
+
+# ML & MLOps
+feast = "^0.41.1"
+mlflow = "^2.11.1"
+onnxruntime = "^1.17.0"
+numpy = "^1.26.0"
+pandas = "^2.2.0"
+scikit-learn = "^1.5.0"
+
+# Orquestación
+prefect = "^2.14.0"
+
+# Utilidades
+structlog = "^24.1.0"
+loguru = "^0.7.2"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0.0"
+ruff = "^0.2.2"
+mypy = "^1.8.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
