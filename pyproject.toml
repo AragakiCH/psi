@@ -11,6 +11,7 @@ packages = [
 
 [tool.poetry.dependencies]
 python = "^3.11"
+opcua = "^0.98.0"
 
 # API / Core
 fastapi = "^0.110.0"
