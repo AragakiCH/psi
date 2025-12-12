@@ -2,7 +2,7 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
 
-    ctrlx_opcua_url: str = "opc.tcp://192.168.18.32:4840"
+    ctrlx_opcua_url: str = "opc.tcp://192.168.100.31:4840"
     ctrlx_opcua_user: str | None = None
     ctrlx_opcua_password: str | None = None
     ctrlx_opcua_period_s: float = 0.1
