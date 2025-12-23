@@ -1,7 +1,7 @@
 import threading
 import time
 import logging
-from typing import Optional, Callable, Dict, List
+from typing import Optional, Callable, Dict, List, Tuple
 
 from opcua import Client, ua
 
@@ -10,20 +10,11 @@ log = logging.getLogger("ctrlx.plc")
 
 class PLCReader:
     """
-    Lector OPC UA para ctrlX, basado en tu proyecto WebSocket_RX.
-
-    - Navega por BrowseName:
-      Objects → Datalayer → plc → app → Application → sym → PLC_PRG
-    - Descubre TODAS las variables debajo de PLC_PRG.
-    - En cada ciclo lee todas, las agrupa por tipo PLC (BOOL, INT, REAL, etc.)
-      y mete un dict en el buffer:
-
-      {
-        "BOOL": { var_name: value, ... },
-        "INT":  { ... },
-        ...
-        "timestamp": <epoch_seconds>
-      }
+    Lector OPC UA robusto:
+    - Conecta, navega a PLC_PRG por BrowseName
+    - Descubre variables bajo PLC_PRG
+    - Lee en ciclo y emite dict por tipo + timestamp
+    - Si PLC cae / red cae => reconecta con backoff
     """
 
     def __init__(
@@ -31,7 +22,7 @@ class PLCReader:
         url: str,
         user: Optional[str],
         password: Optional[str],
-        buffer,
+        buffer: List[Dict],
         buffer_size: int = 1000,
         period_s: float = 0.1,
         on_sample: Optional[Callable[[Dict], None]] = None,
@@ -41,9 +32,11 @@ class PLCReader:
         self.password = password or ""
         self.buffer = buffer
         self.buffer_size = buffer_size
-        self.period_s = period_s
+        self.period_s = float(period_s)
         self.on_sample = on_sample
-        self._stop = False
+
+        self._stop_evt = threading.Event()
+        self._thread: Optional[threading.Thread] = None
 
     # ---------------- helpers ----------------
 
@@ -54,18 +47,19 @@ class PLCReader:
             return val_node.get_value()
         except Exception:
             return node.get_value()
-        
-    
 
     def browse_by_names(self, root, *names):
-        """
-        Navega usando BrowseName.Name, como en tu código viejo.
-        Si no encuentra un segmento, devuelve None.
-        """
+        """Navega usando BrowseName.Name. Si no encuentra, devuelve None."""
         cur = root
         for n in names:
             found = None
-            for ch in cur.get_children():
+            try:
+                children = cur.get_children()
+            except Exception as e:
+                log.error("No pude listar hijos en %s: %s", cur, e)
+                return None
+
+            for ch in children:
                 try:
                     bn = ch.get_browse_name().Name
                 except Exception:
@@ -73,16 +67,43 @@ class PLCReader:
                 if bn == n:
                     found = ch
                     break
+
             if not found:
-                log.error("No se encontró segmento '%s' debajo de %s", n, cur)
-                log.error("Por favor publica un proyecto desde la configuración de símbolos")
+                log.error("No se encontró segmento '%s'. Revisa símbolos publicados en ctrlX.", n)
                 return None
+
             cur = found
         return cur
 
-    # ---------------- loop principal ----------------
+    def _trim_buffer(self):
+        try:
+            while len(self.buffer) >= self.buffer_size:
+                self.buffer.pop(0)
+        except Exception:
+            pass
 
-    def _loop(self) -> None:
+    @staticmethod
+    def _is_connection_drop(exc: Exception) -> bool:
+        """
+        Decide si un error debería disparar reconexión.
+        En planta: si hay dudas, reconecta.
+        """
+        msg = str(exc)
+        needles = [
+            "WinError 10053",              # conexión abortada
+            "WinError 10054",              # connection reset
+            "BadSessionIdInvalid",         # sesión inválida
+            "BadConnectionClosed",         # opcua status
+            "BadSessionClosed",
+            "Connection refused",
+            "timed out",
+            "Timeout",
+            "socket",
+            "Broken pipe",
+        ]
+        return any(n in msg for n in needles)
+
+    def _discover_vars(self, plc_prg) -> List[Tuple[str, str, object]]:
         type_name_map = {
             "Boolean": "BOOL",
             "SByte": "SINT",
@@ -98,7 +119,24 @@ class PLCReader:
             "String": "STRING",
         }
 
-        while not self._stop:
+        nodes = plc_prg.get_children()
+        var_infos = []
+        for ch in nodes:
+            name = ch.get_browse_name().Name
+            try:
+                vt = ua.VariantType(ch.get_data_type_as_variant_type()).name
+            except Exception:
+                vt = "UNKNOWN"
+            var_infos.append((name, type_name_map.get(vt, vt), ch))
+        return var_infos
+
+    # ---------------- loop principal ----------------
+
+    def _loop(self) -> None:
+        backoff = 2.0
+        backoff_max = 30.0
+
+        while not self._stop_evt.is_set():
             cli = None
             try:
                 log.info("Conectando a OPC UA %s", self.url)
@@ -106,11 +144,12 @@ class PLCReader:
                 if self.user:
                     cli.set_user(self.user)
                     cli.set_password(self.password)
+
                 cli.connect()
                 log.info("Conectado a OPC UA")
+                backoff = 2.0  # reset backoff al conectar
 
                 root = cli.get_root_node()
-                # 🔥 MISMO PATH QUE EN TU PROYECTO ANTIGUO
                 plc_prg = self.browse_by_names(
                     root,
                     "Objects",
@@ -121,28 +160,19 @@ class PLCReader:
                     "sym",
                     "PLC_PRG",
                 )
+
                 if plc_prg is None:
-                    # espera un rato y reintenta
+                    # símbolo no publicado / ruta distinta
+                    log.error("No encontré PLC_PRG. Reintentando en 5s…")
                     time.sleep(5.0)
                     continue
 
-                nodes = plc_prg.get_children()
-                var_infos = []
-                for ch in nodes:
-                    name = ch.get_browse_name().Name
-                    try:
-                        vt = ua.VariantType(ch.get_data_type_as_variant_type()).name
-                    except Exception:
-                        vt = "UNKNOWN"
-                    var_infos.append((name, type_name_map.get(vt, vt), ch))
+                var_infos = self._discover_vars(plc_prg)
+                log.info("Descubiertas %d variables bajo PLC_PRG", len(var_infos))
 
-                log.info("Descubiertas %d variables bajo PLC_PRG:", len(var_infos))
-                for name, plc_type_name, _ in var_infos:
-                    log.info("  %s (%s)", name, plc_type_name)
-
-                while not self._stop:
+                # loop de lectura
+                while not self._stop_evt.is_set():
                     vars_by_type: Dict[str, Dict[str, object]] = {}
-                    fatal_error = False
 
                     for name, plc_type_name, node in var_infos:
                         try:
@@ -150,45 +180,15 @@ class PLCReader:
                             bucket = vars_by_type.setdefault(plc_type_name, {})
                             bucket[name] = val
                         except Exception as e:
-                            msg = str(e)
-                            # 🔥 si la conexión OPC UA se cae, marcamos para reconectar
-                            if "WinError 10053" in msg or "BadSessionIdInvalid" in msg:
-                                log.error("Conexión OPC UA abortada, forzando reconexión: %s", msg)
-                                fatal_error = True
-                                break
+                            if self._is_connection_drop(e):
+                                raise  # fuerza reconexión global
                             err_bucket = vars_by_type.setdefault("Error", {})
                             err_bucket[name] = f"⛔ {e}"
 
-                    if fatal_error:
-                        # dejamos que el try/except exterior maneje el reconnect
-                        raise Exception("OPC UA connection dropped (WinError 10053)")
-
                     vars_by_type["timestamp"] = time.time()
 
-                    # poda del buffer
-                    try:
-                        while len(self.buffer) >= self.buffer_size:
-                            self.buffer.pop(0)
-                    except Exception:
-                        pass
-
-                    self.buffer.append(vars_by_type)
-
-                    if self.on_sample:
-                        try:
-                            self.on_sample(dict(vars_by_type))
-                        except Exception as e:
-                            log.warning("on_sample error: %s", e)
-
-                    time.sleep(self.period_s)
-
-                    # poda por tamaño propio
-                    try:
-                        while len(self.buffer) >= self.buffer_size:
-                            self.buffer.pop(0)
-                    except Exception:
-                        pass
-
+                    # buffer + callback (una sola vez, no duplicado)
+                    self._trim_buffer()
                     self.buffer.append(vars_by_type)
 
                     if self.on_sample:
@@ -200,8 +200,13 @@ class PLCReader:
                     time.sleep(self.period_s)
 
             except Exception as e:
-                log.error("Error en loop OPC UA: %s", e)
-                time.sleep(2.0)
+                # cualquier error serio => reconectar
+                log.error("OPC UA loop error: %s", e)
+
+                # backoff progresivo
+                time.sleep(backoff)
+                backoff = min(backoff * 1.7, backoff_max)
+
             finally:
                 if cli is not None:
                     try:
@@ -210,8 +215,11 @@ class PLCReader:
                         pass
 
     def start(self) -> None:
-        t = threading.Thread(target=self._loop, daemon=True)
-        t.start()
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_evt.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
 
     def stop(self) -> None:
-        self._stop = True
+        self._stop_evt.set()

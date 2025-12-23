@@ -1,22 +1,45 @@
 services:
   influxdb:
-    image: influxdb:2.8
+    image: influxdb:2.7
     container_name: influxdb
+    restart: unless-stopped
     ports:
       - "8086:8086"
     volumes:
-      - influxdb-data:/var/lib/influxdb2
-      - influxdb-config:/etc/influxdb2
+      - influxdb_data:/var/lib/influxdb2
     environment:
       DOCKER_INFLUXDB_INIT_MODE: setup
       DOCKER_INFLUXDB_INIT_USERNAME: admin
-      DOCKER_INFLUXDB_INIT_PASSWORD: admin12345
+      DOCKER_INFLUXDB_INIT_PASSWORD: admin123456
       DOCKER_INFLUXDB_INIT_ORG: psi
       DOCKER_INFLUXDB_INIT_BUCKET: telemetry
-      DOCKER_INFLUXDB_INIT_RETENTION: 30d
-      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: super-secret-token
+      DOCKER_INFLUXDB_INIT_RETENTION: 0
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: supersecrettoken
+
+  edge_ingest:
+    build:
+      context: ./services/edge_ingest
+    container_name: edge_ingest
     restart: unless-stopped
+    depends_on:
+      - influxdb
+    ports:
+      - "8000:8000"
+    environment:
+      # Influx
+      INFLUX_URL: http://influxdb:8086
+      INFLUX_TOKEN: supersecrettoken
+      INFLUX_ORG: psi
+      INFLUX_BUCKET: telemetry
+
+      # (si tu writer soporta features bucket)
+      INFLUX_BUCKET_FEATURES: features
+
+      # OPC UA PLC / ctrlX
+      CTRLX_OPCUA_ENDPOINT: "opc.tcp://192.168.17.60:4840"
+      CTRLX_OPCUA_USER: "boschrexroth"
+      CTRLX_OPCUA_PASSWORD: "boschrexroth"
+      CTRLX_OPCUA_PERIOD_S: "1"
 
 volumes:
-  influxdb-data:
-  influxdb-config:
+  influxdb_data:
